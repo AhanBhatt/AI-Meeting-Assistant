@@ -15,6 +15,12 @@ Installer/output files are written to the `release` directory.
 Typical installer file:
 - `release/AI-Meeting-Assistance-Setup-<version>.exe`
 
+## Install The App From Release Folder
+After building, install the desktop app by running:
+- `release/AI-Meeting-Assistance-Setup-<version>.exe`
+
+This installs the packaged app for normal desktop use (no `npm run dev` required).
+
 ## Run Production App Locally (without Vite)
 - Start built app from source tree: `npm run start:prod`
 - In packaged mode, Electron starts the local Express backend automatically.
@@ -52,6 +58,6 @@ Replace `build/icon.ico` with your final brand icon before release.
 2. Launch from Start Menu and confirm app window opens.
 3. Open Settings, add API key (if not set via env).
 4. Select a source, run Capture -> Stop + Answer.
-5. Confirm transcript + answer appear.
+5. Confirm transcript appears and answer text streams progressively.
 6. Confirm sticky-note popout and global shortcut still work.
 7. Uninstall from Windows Apps settings and confirm app is removed.

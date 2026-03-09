@@ -3,6 +3,8 @@ const { execSync } = require("node:child_process");
 const DEV_PORTS = [5173, 8787];
 const killed = [];
 const blockers = [];
+const MAX_WAIT_MS = 4000;
+const POLL_MS = 200;
 
 function run(cmd) {
   return execSync(cmd, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
@@ -58,6 +60,13 @@ function killPid(pid, port) {
   }
 }
 
+function sleep(ms) {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    // Busy-wait is acceptable here for tiny predev script runtime.
+  }
+}
+
 for (const port of DEV_PORTS) {
   const pids = getListeningPidsForPort(port);
   for (const pid of pids) {
@@ -80,4 +89,23 @@ if (killed.length === 0) {
 if (blockers.length > 0) {
   const summary = blockers.map((item) => `${item.image}:${item.pid}@${item.port}`).join(", ");
   console.log(`[predev] Ports still occupied by non-node processes: ${summary}`);
+}
+
+const waitStart = Date.now();
+let waiting = false;
+
+while (Date.now() - waitStart < MAX_WAIT_MS) {
+  const occupied = DEV_PORTS.filter((port) => getListeningPidsForPort(port).length > 0);
+  if (occupied.length === 0) {
+    if (waiting) {
+      console.log(`[predev] Dev ports are now free (waited ${Date.now() - waitStart}ms).`);
+    }
+    break;
+  }
+
+  if (!waiting) {
+    waiting = true;
+    console.log(`[predev] Waiting for dev ports to become free: ${occupied.join(", ")}...`);
+  }
+  sleep(POLL_MS);
 }

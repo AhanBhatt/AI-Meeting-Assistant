@@ -32,6 +32,25 @@ It captures system audio from a selected screen/window, keeps a short pre-roll b
 - Express + TypeScript (local backend)
 - OpenAI API (transcription, responses, optional file search/vector store)
 
+## Install The Desktop App (No Dev Commands)
+
+After you build the installer, you can install the app directly from the `release` folder.
+
+1. Build installer:
+
+```bash
+npm run dist:win
+```
+
+2. Open this file:
+
+- `release/AI-Meeting-Assistance-Setup-<version>.exe`
+
+3. Run the `.exe` installer.
+4. Launch from Start Menu / Desktop shortcut.
+
+You do **not** need to run `npm run dev` after installing the packaged app.
+
 ## How It Works
 
 1. Select a source (screen/window) from the right panel.
@@ -41,6 +60,7 @@ It captures system audio from a selected screen/window, keeps a short pre-roll b
    - optional screenshot capture
    - answer generation
 4. If you typed a prompt, that typed prompt is used as the user question; otherwise transcript is used.
+5. Assistant output streams token-by-token in the chat so you can read immediately.
 
 ## Prerequisites
 
@@ -100,6 +120,8 @@ Output location:
 - `release/AI-Meeting-Assistance-Setup-<version>.exe`
 - Unpacked app: `release/win-unpacked/`
 
+Install by running the `.exe` from the `release` folder.
+
 ## Run Production App From Source Tree
 
 ```bash
@@ -120,6 +142,7 @@ This runs Electron in production mode and serves built frontend/backend assets l
 6. Click `Stop + Answer` to finalize and get response.
 7. For text-only prompts, use `Send` (no capture needed).
 8. Use `Ctrl + Alt + A` to toggle capture globally.
+9. Responses stream in real time; text appears progressively in the assistant bubble.
 
 ## Sticky Notes
 
@@ -166,6 +189,9 @@ scripts/
 - `Failed to fetch` on startup:
   - Confirm local server started on `http://localhost:8787`
   - Re-run `npm run dev`
+- `Error: Request was aborted`:
+  - Usually caused by interrupted network/stream lifecycle; restart app and retry once
+  - Ensure backend stays running during response streaming
 - `MediaRecorder failed to start`:
   - Prefer full screen sources over per-window sources
   - Ensure source has capturable system audio
@@ -174,11 +200,12 @@ scripts/
   - Confirm production paths are loading `dist/` correctly
 - Vite port in use (`5173`):
   - Close stale dev processes and rerun `npm run dev`
+  - `predev` already attempts cleanup and a short wait for port release
 
 ## Publishing Installer On Your Website
 
 1. Run `npm run dist:win`
-2. Upload `release/AI-Meeting-Assistance-Setup-<version>.exe` to your hosting/storage
+2. Upload `release/AI-Meeting-Assistance-Setup-<version>.exe` (from the local `release` folder) to your hosting/storage
 3. Point your website download button to that file
 
 ## About / Legal

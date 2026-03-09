@@ -17,13 +17,30 @@ export default function ChatPane({
   onPopoutAssistant?: (msg: ChatMessage) => void;
 }) {
   const ref = useRef<HTMLDivElement | null>(null);
+  const shouldAutoScrollRef = useRef(true);
+
+  function isNearBottom(el: HTMLDivElement): boolean {
+    const threshold = 72;
+    const distanceToBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    return distanceToBottom <= threshold;
+  }
+
+  function handleScroll() {
+    const el = ref.current;
+    if (!el) return;
+    shouldAutoScrollRef.current = isNearBottom(el);
+  }
 
   useEffect(() => {
-    ref.current?.scrollTo({ top: ref.current.scrollHeight, behavior: "smooth" });
+    const el = ref.current;
+    if (!el) return;
+    if (!shouldAutoScrollRef.current) return;
+
+    el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
   }, [messages.length]);
 
   return (
-    <div className="chat" ref={ref}>
+    <div className="chat" ref={ref} onScroll={handleScroll}>
       {messages.map(m => (
         <MessageBubble
           key={m.id}

@@ -186,6 +186,108 @@ function shouldUseFileSearch(text: string): boolean {
   );
 }
 
+function wantsCoachingMode(typedQuestion: string): boolean {
+  const text = String(typedQuestion || "").trim();
+  if (!text) return false;
+
+  return /(coach|coaching|feedback|critique|improve|improvement|mock interview|tips|what should i say|how should i answer|how can i answer|sample answer|answer draft|evaluate my answer|review my answer|rewrite my answer)/i.test(
+    text
+  );
+}
+
+function stripLeadingInstructionPreamble(text: string): string {
+  let out = String(text || "");
+  const patterns = [
+    /^\s*(?:here'?s|this is)\s+(?:a\s+)?(?:strong|good|sample|suggested)\s+answer\s*[:\-]\s*/i,
+    /^\s*(?:you\s+(?:can|could|should|may|might)\s+(?:say|answer|respond(?:\s+with)?)(?:\s+something\s+like)?|one\s+way\s+to\s+answer\s+is|a\s+(?:strong|good)\s+answer\s+would\s+be)\s*[:\-]?\s*/i,
+    /^\s*(?:mention|highlight|explain\s+that|emphasize)\b[^:\n]{0,90}[:\-]\s*/i,
+    /^\s*answer\s*[:\-]\s*/i
+  ];
+
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const pattern of patterns) {
+      const next = out.replace(pattern, "");
+      if (next !== out) {
+        out = next.trimStart();
+        changed = true;
+      }
+    }
+  }
+
+  out = out.replace(/^"\s*([\s\S]*?)\s*"\s*$/i, "$1");
+  return out.trim();
+}
+
+function enforceAnswerStyle(text: string, coachingMode: boolean): string {
+  const trimmed = String(text || "").trim();
+  if (!trimmed) return "(no output)";
+  if (coachingMode) return trimmed;
+
+  const rewritten = stripLeadingInstructionPreamble(trimmed);
+  return rewritten || trimmed;
+}
+
+function buildSystemPrompt(options: { coachingMode: boolean; useFileSearch: boolean }): string {
+  const { coachingMode, useFileSearch } = options;
+
+  if (coachingMode) {
+    return (
+      "You are an interview coach. The user explicitly requested coaching/feedback mode. " +
+      "You may give advice, suggested phrasing, and improvements. " +
+      "Be specific and practical, and keep the response concise but complete. " +
+      "Use transcript as primary evidence, uploaded files when available, and screenshot as secondary evidence."
+    );
+  }
+
+  return (
+    "You are the candidate speaking in a live interview. " +
+    "Respond in first person as the exact words I should say out loud right now. " +
+    "Give the answer itself, not advice about the answer. " +
+    "Never use coaching/meta phrasing such as: 'you can say', 'you should say', 'mention', 'highlight', 'explain that', 'a good answer would be'. " +
+    "Do not label roles (no interviewer/interviewee tags). " +
+    "Use natural spoken interview style, concise but strong, mostly paragraph form unless bullets are explicitly requested. " +
+    "If transcript is messy, infer the likely question and answer directly in first person. " +
+    "Do not output a partial or cut-off answer. " +
+    "Treat transcript as primary source of truth. " +
+    (useFileSearch
+      ? "Use uploaded files to personalize resume/background/project answers. "
+      : "Uploaded-file retrieval is disabled for this request, so do not assume file details. ") +
+    "Treat screenshot as secondary evidence only."
+  );
+}
+
+function buildContinuationPrompt(coachingMode: boolean): string {
+  return coachingMode
+    ? "Continue exactly where your last answer ended. Do not restart or repeat earlier sections. Finish with complete sentences."
+    : "Continue exactly where your last answer ended in the same direct first-person speaking voice. Do not restart or repeat earlier sections. Do not switch to coaching/advice framing. Finish with complete spoken sentences.";
+}
+
+function wantsSseResponse(req: express.Request): boolean {
+  const streamQuery = String(req.query.stream || "").trim().toLowerCase();
+  if (streamQuery === "1" || streamQuery === "true" || streamQuery === "yes") {
+    return true;
+  }
+
+  const accept = String(req.headers.accept || "");
+  return accept.includes("text/event-stream");
+}
+
+function beginSse(res: express.Response): void {
+  res.status(200);
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders?.();
+}
+
+function writeSse(res: express.Response, event: string, payload: unknown): void {
+  res.write(`event: ${event}\n`);
+  res.write(`data: ${JSON.stringify(payload)}\n\n`);
+}
+
 function createApiApp(): express.Express {
   const app = express();
   const upload = multer({ storage: multer.memoryStorage() });
@@ -353,6 +455,7 @@ function createApiApp(): express.Express {
           : transcript.trim().length > 0
             ? transcript
             : "Extract the question(s) asked and draft the best possible answer.";
+      const coachingMode = wantsCoachingMode(typedTrimmed);
 
       const kbFiles = listVectorStoreFiles();
       const hasKbFiles = kbFiles.length > 0;
@@ -372,6 +475,12 @@ function createApiApp(): express.Express {
               ? "2) Uploaded files are supporting context (resume/background/projects).\n"
               : "2) Uploaded files are disabled for this request to reduce latency.\n") +
             "3) Screenshot is secondary and should only be used when transcript lacks needed visual detail."
+        },
+        {
+          type: "input_text",
+          text: coachingMode
+            ? "Mode: coach me (explicitly requested by user). Coaching and feedback are allowed."
+            : "Mode: answer as me. Provide only the direct first-person answer I would speak."
         },
         { type: "input_text", text: `Transcript (captured segment):\n${transcript || "(no transcript)"}` },
         { type: "input_text", text: `User instruction (typed if provided, else transcript-as-question):\n${finalPrompt}` }
@@ -409,16 +518,7 @@ function createApiApp(): express.Express {
             content: [
               {
                 type: "input_text",
-                text:
-                  "You are a meeting copilot. Provide a detailed, complete answer the user can say in an interview/meeting. " +
-                  "Use clear structure with complete sentences (multiple bullets or short sections are fine). " +
-                  "Do not output a partial or cut-off answer. " +
-                  "Treat transcript as the primary source of truth. " +
-                  (useFileSearch
-                    ? "Use uploaded files to ground personal/context questions (resume/background/projects). "
-                    : "Do not use uploaded-file assumptions for this request because retrieval is disabled. ") +
-                  "Treat screenshot as secondary evidence only. " +
-                  "If critical context is missing, ask one short clarifying question at the end."
+                text: buildSystemPrompt({ coachingMode, useFileSearch })
               }
             ]
           },
@@ -439,6 +539,126 @@ function createApiApp(): express.Express {
           : {})
       };
 
+      if (wantsSseResponse(req)) {
+        beginSse(res);
+        writeSse(res, "transcript", { transcript });
+
+        let answerText = "";
+        let lastResponseId: string | null = null;
+        let disconnected = false;
+
+        req.on("aborted", () => {
+          disconnected = true;
+        });
+        res.on("close", () => {
+          if (!res.writableEnded) {
+            disconnected = true;
+          }
+        });
+
+        try {
+          for (let i = 0; i < 3; i++) {
+            if (disconnected || res.writableEnded) break;
+
+            if (i > 0 && answerText.length > 0) {
+              answerText += "\n";
+              writeSse(res, "delta", { delta: "\n" });
+            }
+
+            const streamParams: any =
+              i === 0
+                ? responseConfig
+                : {
+                    model,
+                    previous_response_id: lastResponseId,
+                    max_output_tokens: 900,
+                    input: [
+                      {
+                        role: "user",
+                        content: [
+                          {
+                            type: "input_text",
+                            text:
+                              buildContinuationPrompt(coachingMode)
+                          }
+                        ]
+                      }
+                    ]
+                  };
+
+            const stream: any = client.responses.stream(streamParams);
+            let emittedChunk = "";
+
+            for await (const event of stream) {
+              if (disconnected || res.writableEnded) break;
+
+              if (event.type === "response.output_text.delta") {
+                const delta = String(event.delta || "");
+                if (!delta) continue;
+                emittedChunk += delta;
+                answerText += delta;
+                writeSse(res, "delta", { delta });
+              } else if (event.type === "response.refusal.delta") {
+                const delta = String(event.delta || "");
+                if (!delta) continue;
+                emittedChunk += delta;
+                answerText += delta;
+                writeSse(res, "delta", { delta });
+              }
+            }
+
+            if (disconnected || res.writableEnded) {
+              break;
+            }
+
+            const finalResponse: any = await stream.finalResponse();
+            const finalChunk = String(finalResponse?.output_text || "");
+            lastResponseId = finalResponse?.id || lastResponseId;
+            const incompleteReason = finalResponse?.incomplete_details?.reason;
+
+            // If the SDK stream didn't emit every text fragment as deltas, send the missing suffix.
+            if (!disconnected && !res.writableEnded && finalChunk && finalChunk !== emittedChunk) {
+              const missingSuffix = finalChunk.startsWith(emittedChunk)
+                ? finalChunk.slice(emittedChunk.length)
+                : emittedChunk
+                  ? `\n${finalChunk}`
+                  : finalChunk;
+
+              if (missingSuffix) {
+                answerText += missingSuffix;
+                writeSse(res, "delta", { delta: missingSuffix });
+              }
+            }
+
+            if (incompleteReason !== "max_output_tokens" || !lastResponseId) {
+              break;
+            }
+          }
+
+          const finalAnswer = enforceAnswerStyle(answerText, coachingMode);
+          if (!disconnected && !res.writableEnded) {
+            if (answerText.trim().length === 0) {
+              writeSse(res, "delta", { delta: finalAnswer });
+            }
+            writeSse(res, "done", {
+              transcript,
+              answerText: finalAnswer
+            });
+            res.end();
+          }
+          return;
+        } catch (streamErr: any) {
+          if (disconnected || res.writableEnded) {
+            return;
+          }
+          if (!res.writableEnded) {
+            writeSse(res, "error", { error: streamErr?.message || String(streamErr) });
+            res.end();
+          }
+          return;
+        }
+      }
+
       let response = await client.responses.create(responseConfig);
       let answerText = response.output_text || "";
       let lastResponse: any = response;
@@ -457,10 +677,7 @@ function createApiApp(): express.Express {
               content: [
                 {
                   type: "input_text",
-                  text:
-                    "Continue exactly where your last answer ended. " +
-                    "Do not restart or repeat earlier sections. " +
-                    "Finish with complete, detailed sentences."
+                  text: buildContinuationPrompt(coachingMode)
                 }
               ]
             }
@@ -476,7 +693,7 @@ function createApiApp(): express.Express {
 
       res.json({
         transcript,
-        answerText: answerText || "(no output)"
+        answerText: enforceAnswerStyle(answerText, coachingMode)
       });
     } catch (e: any) {
       res.status(500).json({ error: e?.message || String(e) });

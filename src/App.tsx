@@ -38,6 +38,30 @@ type UsageSummaryResponse = {
   warning?: string;
 };
 
+type AskRequestBody = {
+  typedQuestion?: string;
+  transcript?: string;
+  audioDataUrl?: string;
+  screenshotBase64Png?: string;
+  useFiles?: boolean;
+};
+
+type AskStreamDonePayload = {
+  transcript: string;
+  answerText: string;
+};
+
+type AskStreamHandlers = {
+  onTranscript?: (transcript: string) => void;
+  onDelta: (delta: string) => void;
+  onDone: (payload: AskStreamDonePayload) => void;
+};
+
+type ParsedSseEvent = {
+  event: string;
+  data: any;
+};
+
 declare global {
   interface Window {
     bridge: {
@@ -214,6 +238,48 @@ async function withRetry<T>(task: () => Promise<T>, attempts: number, delayMs: n
   throw new Error(`${label}: ${(lastError as any)?.message || String(lastError)}`);
 }
 
+function parseSseBlock(raw: string): ParsedSseEvent | null {
+  const normalized = raw.replace(/\r/g, "");
+  const lines = normalized.split("\n");
+  let event = "message";
+  const dataLines: string[] = [];
+
+  for (const line of lines) {
+    if (!line) continue;
+    if (line.startsWith(":")) continue;
+    if (line.startsWith("event:")) {
+      event = line.slice("event:".length).trim() || "message";
+      continue;
+    }
+    if (line.startsWith("data:")) {
+      dataLines.push(line.slice("data:".length).trimStart());
+    }
+  }
+
+  const dataText = dataLines.join("\n");
+  if (!dataText) {
+    return { event, data: {} };
+  }
+
+  try {
+    return { event, data: JSON.parse(dataText) };
+  } catch {
+    return { event, data: { value: dataText } };
+  }
+}
+
+async function parseErrorResponse(resp: Response): Promise<string> {
+  const text = await resp.text().catch(() => "");
+  if (!text) return `Request failed (${resp.status})`;
+
+  try {
+    const data = JSON.parse(text);
+    return String(data?.error || text);
+  } catch {
+    return text;
+  }
+}
+
 export default function App() {
   const [sources, setSources] = useState<Source[]>([]);
   const [selectedSourceId, setSelectedSourceId] = useState<string | null>(null);
@@ -383,6 +449,93 @@ export default function App() {
     }
 
     return status;
+  }
+
+  function patchMessageById(id: string, updater: (prev: ChatMessage) => ChatMessage) {
+    setMessages((prev) => prev.map((msg) => (msg.id === id ? updater(msg) : msg)));
+  }
+
+  function appendAssistantDelta(messageId: string, delta: string) {
+    if (!delta) return;
+    patchMessageById(messageId, (msg) => ({
+      ...msg,
+      text: (msg.text || "") + delta
+    }));
+  }
+
+  async function streamAsk(payload: AskRequestBody, handlers: AskStreamHandlers): Promise<AskStreamDonePayload> {
+    const resp = await fetch(`${serverBase}/ask?stream=1`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "text/event-stream"
+      },
+      body: JSON.stringify(payload)
+    });
+
+    if (!resp.ok) {
+      throw new Error(await parseErrorResponse(resp));
+    }
+    if (!resp.body) {
+      throw new Error("Streaming response body is missing.");
+    }
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let donePayload: AskStreamDonePayload | null = null;
+
+    const consumeBlock = (block: string) => {
+      const parsed = parseSseBlock(block);
+      if (!parsed) return;
+
+      if (parsed.event === "transcript") {
+        handlers.onTranscript?.(String(parsed.data?.transcript || ""));
+        return;
+      }
+
+      if (parsed.event === "delta") {
+        const delta = String(parsed.data?.delta || parsed.data?.value || "");
+        if (delta) handlers.onDelta(delta);
+        return;
+      }
+
+      if (parsed.event === "done") {
+        donePayload = {
+          transcript: String(parsed.data?.transcript || ""),
+          answerText: String(parsed.data?.answerText || "")
+        };
+        handlers.onDone(donePayload);
+        return;
+      }
+
+      if (parsed.event === "error") {
+        throw new Error(String(parsed.data?.error || parsed.data?.value || "Streaming request failed"));
+      }
+    };
+
+    while (true) {
+      const { value, done } = await reader.read();
+      buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+
+      let boundary = buffer.indexOf("\n\n");
+      while (boundary >= 0) {
+        const block = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        consumeBlock(block);
+        if (donePayload) return donePayload;
+        boundary = buffer.indexOf("\n\n");
+      }
+
+      if (done) break;
+    }
+
+    if (buffer.trim()) {
+      consumeBlock(buffer);
+      if (donePayload) return donePayload;
+    }
+
+    throw new Error("Response stream ended before completion.");
   }
 
   async function captureSelectedSourceScreenshot(): Promise<string | undefined> {
@@ -815,6 +968,7 @@ export default function App() {
   async function stopCaptureAndAsk() {
     const stopPressedAt = Date.now();
     const sessionId = realtimeSessionIdRef.current;
+    let streamedAssistantMessageId: string | null = null;
 
     isCapturingRef.current = false;
     setIsCapturing(false);
@@ -892,45 +1046,93 @@ export default function App() {
         );
       }
 
-      const askResp = await fetch(`${serverBase}/ask`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+      const userMessageId = uid();
+      const assistantMessageId = uid();
+      streamedAssistantMessageId = assistantMessageId;
+      const assistantCreatedAt = Date.now();
+      let streamTranscript = transcript;
+      const initialUserText = typed.length > 0 ? typed : streamTranscript || "(transcribing...)";
+
+      setMessages((prev) => [
+        ...prev,
+        { id: userMessageId, role: "user", text: initialUserText, createdAt: stopPressedAt },
+        {
+          id: assistantMessageId,
+          role: "assistant",
+          text: "",
+          transcript: streamTranscript || undefined,
+          createdAt: assistantCreatedAt
+        }
+      ]);
+
+      await streamAsk(
+        {
           typedQuestion: typed,
           transcript,
           audioDataUrl,
           screenshotBase64Png: screenshotBase64,
           useFiles: forceUseFiles
-        })
-      });
-
-      const askData = await askResp.json();
-      if (!askResp.ok) throw new Error(askData?.error || "Request failed");
-
-      const finalTranscript = String(askData?.transcript || transcript || "").trim();
-      const userText = typed.length > 0 ? typed : finalTranscript || "(no transcript)";
-
-      setMessages((prev) => [
-        ...prev,
-        { id: uid(), role: "user", text: userText, createdAt: stopPressedAt },
+        },
         {
-          id: uid(),
-          role: "assistant",
-          text: askData.answerText,
-          transcript: finalTranscript,
-          createdAt: Date.now()
+          onTranscript: (nextTranscript) => {
+            const trimmed = String(nextTranscript || "").trim();
+            if (trimmed) {
+              streamTranscript = trimmed;
+            }
+
+            patchMessageById(assistantMessageId, (msg) => ({
+              ...msg,
+              transcript: streamTranscript || msg.transcript
+            }));
+
+            if (!typed) {
+              patchMessageById(userMessageId, (msg) => ({
+                ...msg,
+                text: streamTranscript || "(no transcript)"
+              }));
+            }
+          },
+          onDelta: (delta) => {
+            appendAssistantDelta(assistantMessageId, delta);
+          },
+          onDone: (done) => {
+            const finalTranscript = String(done.transcript || streamTranscript || "").trim();
+            const finalAnswer = String(done.answerText || "").trim();
+
+            patchMessageById(assistantMessageId, (msg) => ({
+              ...msg,
+              text: finalAnswer || msg.text || "(no output)",
+              transcript: finalTranscript || msg.transcript
+            }));
+
+            if (!typed) {
+              patchMessageById(userMessageId, (msg) => ({
+                ...msg,
+                text:
+                  finalTranscript ||
+                  (msg.text === "(transcribing...)" ? "(no transcript)" : msg.text || "(no transcript)")
+              }));
+            }
+          }
         }
-      ]);
+      );
     } catch (e: any) {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: uid(),
-          role: "assistant",
-          text: `Error: ${e?.message || e}`,
-          createdAt: Date.now()
-        }
-      ]);
+      if (streamedAssistantMessageId) {
+        patchMessageById(streamedAssistantMessageId, (msg) => ({
+          ...msg,
+          text: msg.text ? `${msg.text}\n\nError: ${e?.message || e}` : `Error: ${e?.message || e}`
+        }));
+      } else {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: uid(),
+            role: "assistant",
+            text: `Error: ${e?.message || e}`,
+            createdAt: Date.now()
+          }
+        ]);
+      }
       await cancelRealtimeSession();
     } finally {
       segmentChunksRef.current = [];
@@ -946,6 +1148,7 @@ export default function App() {
     const sendPressedAt = Date.now();
     const useFiles = uploadOnAskFiles.length > 0 || (alwaysUseUploadedFiles && persistentFiles.length > 0);
     const needsScreenshot = shouldIncludeScreenshot(typed);
+    let streamedAssistantMessageId: string | null = null;
 
     setQuestion("");
     setIsBusy(true);
@@ -971,40 +1174,69 @@ export default function App() {
 
       const [screenshotBase64] = await Promise.all([screenshotPromise, uploadPromise]);
 
-      const askResp = await fetch(`${serverBase}/ask`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+      const userMessageId = uid();
+      const assistantMessageId = uid();
+      streamedAssistantMessageId = assistantMessageId;
+      const assistantCreatedAt = Date.now();
+
+      setMessages((prev) => [
+        ...prev,
+        { id: userMessageId, role: "user", text: typed, createdAt: sendPressedAt },
+        {
+          id: assistantMessageId,
+          role: "assistant",
+          text: "",
+          createdAt: assistantCreatedAt
+        }
+      ]);
+
+      await streamAsk(
+        {
           typedQuestion: typed,
           screenshotBase64Png: screenshotBase64,
           useFiles
-        })
-      });
-
-      const askData = await askResp.json();
-      if (!askResp.ok) throw new Error(askData?.error || "Request failed");
-
-      setMessages((prev) => [
-        ...prev,
-        { id: uid(), role: "user", text: typed, createdAt: sendPressedAt },
+        },
         {
-          id: uid(),
-          role: "assistant",
-          text: askData.answerText,
-          transcript: askData.transcript,
-          createdAt: Date.now()
+          onTranscript: (nextTranscript) => {
+            const trimmed = String(nextTranscript || "").trim();
+            if (!trimmed) return;
+            patchMessageById(assistantMessageId, (msg) => ({
+              ...msg,
+              transcript: trimmed
+            }));
+          },
+          onDelta: (delta) => {
+            appendAssistantDelta(assistantMessageId, delta);
+          },
+          onDone: (done) => {
+            const finalTranscript = String(done.transcript || "").trim();
+            const finalAnswer = String(done.answerText || "").trim();
+
+            patchMessageById(assistantMessageId, (msg) => ({
+              ...msg,
+              text: finalAnswer || msg.text || "(no output)",
+              transcript: finalTranscript || msg.transcript
+            }));
+          }
         }
-      ]);
+      );
     } catch (e: any) {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: uid(),
-          role: "assistant",
-          text: `Error: ${e?.message || e}`,
-          createdAt: Date.now()
-        }
-      ]);
+      if (streamedAssistantMessageId) {
+        patchMessageById(streamedAssistantMessageId, (msg) => ({
+          ...msg,
+          text: msg.text ? `${msg.text}\n\nError: ${e?.message || e}` : `Error: ${e?.message || e}`
+        }));
+      } else {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: uid(),
+            role: "assistant",
+            text: `Error: ${e?.message || e}`,
+            createdAt: Date.now()
+          }
+        ]);
+      }
     } finally {
       setIsBusy(false);
     }
