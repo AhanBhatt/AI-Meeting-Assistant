@@ -1,4 +1,4 @@
-# AI Meeting Assistance — Agent Guide (Windows)
+# AI Meeting Assistance - Agent Guide (Windows)
 
 This repo is an Electron desktop app + local Express server.
 
