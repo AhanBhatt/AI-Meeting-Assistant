@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+dist-electron/
+dist-server/
+release/
+
+# Runtime/dev logs
+*.log
+smoke-dev.out.log
+smoke-dev.err.log
+
+# Environment secrets
+.env
+.env.*
+!.env.example
+
+# OS/editor artifacts
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/

@@ -1,0 +1,1 @@
+Replace build/icon.ico with your final branded icon before release if needed.`nCurrent file is a generated placeholder icon.
